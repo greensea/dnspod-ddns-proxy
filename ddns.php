@@ -17,18 +17,39 @@ $api_token = isset($_POST['api_token']) ? $_POST['api_token'] : '';
 if (!$value) {
     apiout(-20, '没有获取到客户端 IP，不会进行任何操作');
 }
-if (!$domain || !$record_id || !$sub_domain || !$api_token) {
-    apiout(-30, 'domain 或 record_id 或 sub_domain 或 api_token 参数为空', [
+if (!$domain || !$record_id || !$sub_domain) {
+    apiout(-30, '没有提供 domain 或 record_id 或 sub_domain', [
         'domain' => $domain,
         'record_id' => $record_id,
         'sub_domain' => $sub_domain,
-        'api_token' => $api_token,
     ]);
 }
 
+
+/// 1. 进行认证
+if (!isset($_POST['api_token']) && !isset($_POST['sign'])) {
+    apiout(-35, '没有提供 api_token 参数，也没有提供 sign 参数');
+}
+/// 如果提供了 api_token，则直接使用，否则根据 sign 进行查询
+$api_token = '';
+if (isset($_POST['api_token'])) {
+    $api_token = $_POST['api_token'];
+}
+else {
+    $api_token = search_api_token();
+}
+if (!$api_token) {
+    apiout(-38, '没有提供 api_token，或提供了 sign，但没有找到 sign 对应的 API TOKEN');
+}
+
+
 /// 2. 判断是否需要更新
 LOGD("要更新的记录是 ({$domain}-{$record_id})，客户端的地址是 {$value}");
-$latest_ip = get_latest_record_ip($domain, $record_id);
+$c = get_config($domain, $record_id);
+$latest_ip = '';
+if (isset($c['ip'])) {
+    $latest_ip = $c['ip'];
+}
 if ($latest_ip == $value) {
     LOGD("最后更新的 IP 和当前客户端 IP 都是 {$value}，不会进行更新");
     apiout(0, 'IP 没有改变，不用更新');
@@ -71,7 +92,12 @@ if ($j['status']['code'] != 1) {
 
 
 /// 更新成功，修改本机状态缓存
-set_latest_record_ip($domain, $record_id, $value);
+$c = get_config($domain, $record_id);
+if (!$c) {
+    $c = [];
+}
+$c['ip'] = $value;
+set_config($domain, $record_id, $c);
 apiout(0, "域名记录修改成功({$domain}-{$record_id}) --> {$value}");
 
 
@@ -80,10 +106,10 @@ apiout(0, "域名记录修改成功({$domain}-{$record_id}) --> {$value}");
 /**
  * 获取该域名记录的最后一次更新到的 IP 地址
  */
-function get_latest_record_ip($domain, $record_id) {
+function get_config($domain, $record_id) {
     $path = "/tmp/ddns-latest-dns-{$domain}-{$record_id}";
     if (file_exists($path)) {
-        return file_get_contents($path);
+        return unserialize(file_get_contents($path));
     }
     else {
         return '';
@@ -93,9 +119,9 @@ function get_latest_record_ip($domain, $record_id) {
 /**
  * 设置该域名记录最后一次更新到的 IP 地址
  */
-function set_latest_record_ip($domain, $record_id, $ip) {
+function set_config($domain, $record_id, $data) {
     $path = "/tmp/ddns-latest-dns-{$domain}-{$record_id}";
-    file_put_contents($path, $ip);
+    file_put_contents($path, serialize($data));
     
     return TRUE;
 }
@@ -125,7 +151,7 @@ function request($url, $params, &$err) {
         CURLOPT_POSTFIELDS => $params,
         CURLOPT_RETURNTRANSFER => 1,
         CURLOPT_TIMEOUT => 30,
-        CURLOPT_USERAGNET => 'ddns/1.0 (gs@bbxy.net)'
+        CURLOPT_USERAGENT => 'ddns/1.0 (gs@bbxy.net)'
     ]);
     
     LOGD("发起 URL 请求: {$url}");
@@ -156,4 +182,55 @@ function LOGD($s) {
     $log = sprintf("[%s] %s\n", $time, $s);
     
     file_put_contents(LOG_PATH, $log, FILE_APPEND);
+}
+
+/**
+ * 根据当前的请求参数，查找到对应的 API TOKEN
+ */
+function search_api_token() {   
+    $sign = '';
+    
+    $params = $_POST;
+    ksort($params);
+    
+    if (isset($params['sign'])) {
+        $sign = $params['sign'];
+        unset($params['sign']);
+    }
+    else {
+        LOGD("没有提供签名签名参数(sign)");
+        return FALSE;
+    }
+    
+    $tokens = [];
+    foreach ($params as $k => $v) {
+        $tokens[] = "{$k}={$v}";
+    }
+    $plain = implode('&', $tokens);
+
+    foreach (DNSPOD_API_TOKENS as $api_token) {
+        /// 检查 nonce
+        $ts = time();
+        $c = get_config($params['domain'], $params['record_id']);
+        if (!isset($c['timestamp'])) {
+            $c['timestamp'] = 0;
+        }
+        $timestamp = isset($params['timestamp']) ? (int)$params['timestamp'] : 0;
+        
+        if ((int)$timestamp <= $c['timestamp']) {
+            LOGD("timestamp({$timestamp}) 已经被使用过了, GET 参数: " . json_encode($params));
+            return FALSE;
+        }
+        
+        $our_sign = md5($plain . $api_token);
+        LOGD("检查签名 {$our_sign} == {$sign}，明文是 {$plain}{$api_token}");
+        if ($our_sign == $sign) {
+            $c['timestamp'] = $params['timestamp'];
+            set_config($params['domain'], $params['record_id'], $c);
+            
+            return $api_token;
+        }
+    }
+    
+    return FALSE;
 }
